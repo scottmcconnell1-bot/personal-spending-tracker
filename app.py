@@ -30,19 +30,18 @@ def init_db():
         amount REAL NOT NULL,
         check_num TEXT,
         status TEXT,
-        category TEXT DEFAULT 'Uncategorized',
+        category TEXT DEFAULT 'Personal Spending',
+        is_excluded INTEGER DEFAULT 0,
         UNIQUE(date, description, amount)
     )
     """)
+    
     defaults = [
         "Personal Spending",
-        "Groceries",
-        "Utilities",
-        "Housing",
-        "Dining Out",
+        "Dining & Snacks",
+        "Hobbies & Shopping",
         "Entertainment",
-        "Income",
-        "Uncategorized",
+        "Miscellaneous Personal"
     ]
     for cat in defaults:
         cursor.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (cat,))
@@ -71,34 +70,17 @@ def get_categories():
     conn.close()
     return categories
 
-def add_category(name: str) -> bool:
-    if not name.strip():
-        return False
-    conn = get_db_connection()
-    try:
-        conn.execute("INSERT INTO categories (name) VALUES (?)", (name.strip(),))
-        conn.commit()
+def is_auto_excluded(description: str, amount: float) -> bool:
+    if amount > 0:
         return True
-    except sqlite3.IntegrityError:
-        return False
-    finally:
-        conn.close()
-
-def rename_category(old_name: str, new_name: str):
-    if not new_name.strip():
-        return
-    conn = get_db_connection()
-    conn.execute("UPDATE categories SET name = ? WHERE name = ?", (new_name.strip(), old_name))
-    conn.execute("UPDATE transactions SET category = ? WHERE category = ?", (new_name.strip(), old_name))
-    conn.commit()
-    conn.close()
-
-def delete_category(name: str):
-    conn = get_db_connection()
-    conn.execute("DELETE FROM categories WHERE name = ?", (name,))
-    conn.execute("UPDATE transactions SET category = 'Uncategorized' WHERE category = ?", (name,))
-    conn.commit()
-    conn.close()
+    
+    desc_upper = description.upper()
+    excluded_keywords = [
+        "GROCERY", "WALMART", "KROGER", "ALDI", "SAFEWAY", "COSTCO",
+        "SHELL", "CHEVRON", "EXXON", "MAVERIK", "FUEL", "GAS",
+        "UTILITY", "POWER", "WATER", "MORTGAGE", "RENT", "INSURANCE"
+    ]
+    return any(keyword in desc_upper for keyword in excluded_keywords)
 
 def import_csv_files(files):
     conn = get_db_connection()
@@ -121,14 +103,15 @@ def import_csv_files(files):
             check_val = str(row["CHECK #"]) if "CHECK #" in df.columns and pd.notna(row["CHECK #"]) else ""
             status_val = str(row["STATUS"]) if "STATUS" in df.columns and pd.notna(row["STATUS"]) else ""
             cycle_val = calculate_cycle(date_val)
+            excluded_flag = 1 if is_auto_excluded(desc_val, amount_val) else 0
 
             try:
                 conn.execute(
                     """
-                INSERT INTO transactions (date, cycle_name, description, amount, check_num, status, category)
-                VALUES (?, ?, ?, ?, ?, ?, 'Uncategorized')
+                INSERT INTO transactions (date, cycle_name, description, amount, check_num, status, category, is_excluded)
+                VALUES (?, ?, ?, ?, ?, ?, 'Personal Spending', ?)
                 """,
-                    (date_val, cycle_val, desc_val, amount_val, check_val, status_val),
+                    (date_val, cycle_val, desc_val, amount_val, check_val, status_val, excluded_flag),
                 )
                 imported_count += 1
             except sqlite3.IntegrityError:
@@ -138,16 +121,16 @@ def import_csv_files(files):
     conn.close()
     return imported_count, skipped_count
 
-def update_transaction_category(tx_id: int, category: str):
+def update_transaction_status(tx_id: int, is_excluded: int, category: str):
     conn = get_db_connection()
-    conn.execute("UPDATE transactions SET category = ? WHERE id = ?", (category, tx_id))
+    conn.execute("UPDATE transactions SET is_excluded = ?, category = ? WHERE id = ?", (is_excluded, category, tx_id))
     conn.commit()
     conn.close()
 
 st.set_page_config(page_title="Personal Spending Tracker", page_icon="💳", layout="wide")
 init_db()
 
-st.title("💳 Personal Spending Tracker & Budget Manager")
+st.title("💳 Personal Spending Tracker")
 
 with st.sidebar:
     st.header("📂 CSV File Importer")
@@ -157,11 +140,7 @@ with st.sidebar:
         st.subheader("Select files to import:")
         file_dict = {f.name: f for f in uploaded_files}
         
-        selected_filenames = []
-        for fname in file_dict.keys():
-            if st.checkbox(fname, value=True):
-                selected_filenames.append(fname)
-        
+        selected_filenames = [fname for fname in file_dict.keys() if st.checkbox(fname, value=True)]
         selected_files = [file_dict[fname] for fname in selected_filenames]
         
         if st.button("Import Selected Files"):
@@ -169,122 +148,78 @@ with st.sidebar:
                 st.warning("No files selected for import.")
             else:
                 added, skipped = import_csv_files(selected_files)
-                st.success(f"Successfully imported **{added}** new records from {len(selected_files)} file(s)! ({skipped} duplicates automatically ignored).")
+                st.success(f"Imported **{added}** records ({skipped} duplicates skipped). Auto-filtered non-personal items.")
                 st.rerun()
 
-    st.divider()
-    st.header("⚙️ Category Management")
-
-    new_cat = st.text_input("Create Category")
-    if st.button("Add Category") and new_cat:
-        if add_category(new_cat):
-            st.success(f"Added category: '{new_cat}'")
-            st.rerun()
-        else:
-            st.error("Category already exists or is blank.")
-
-    categories = get_categories()
-    selected_cat_to_edit = st.selectbox("Select Category to Edit/Delete", categories)
-
-    col_edit1, col_edit2 = st.columns(2)
-    with col_edit1:
-        rename_to = st.text_input("New Name", key="rename_input")
-        if st.button("Rename") and rename_to:
-            rename_category(selected_cat_to_edit, rename_to)
-            st.success("Category renamed!")
-            st.rerun()
-    with col_edit2:
-        if st.button("Delete"):
-            if selected_cat_to_edit not in ["Personal Spending", "Uncategorized"]:
-                delete_category(selected_cat_to_edit)
-                st.warning(f"Deleted '{selected_cat_to_edit}'.")
-                st.rerun()
-            else:
-                st.error("Cannot delete core system categories.")
-
-tab1, tab2, tab3 = st.tabs(["📊 Dashboard & Budget", "🏷️ Tag Transactions", "📈 Monthly Comparisons"])
+tab1, tab2 = st.tabs(["📊 Personal Budget Dashboard", "⚙️ Filter & Tag Transactions"])
 
 conn = get_db_connection()
 df_tx = pd.read_sql_query("SELECT * FROM transactions", conn)
 conn.close()
 
 if df_tx.empty:
-    st.info("No transaction data loaded yet. Please upload your bank CSV file using the sidebar to get started!")
+    st.info("No transaction data loaded yet. Upload your bank CSV file in the sidebar to get started!")
 else:
     cycles = sorted(df_tx["cycle_name"].unique().tolist(), reverse=True)
 
     with tab1:
         selected_cycle = st.selectbox("Select Billing Cycle", cycles)
-        cycle_df = df_tx[df_tx["cycle_name"] == selected_cycle].copy()
-
-        personal_df = cycle_df[(cycle_df["category"] == "Personal Spending") & (cycle_df["amount"] < 0)]
+        
+        personal_df = df_tx[(df_tx["cycle_name"] == selected_cycle) & (df_tx["is_excluded"] == 0) & (df_tx["amount"] < 0)].copy()
+        
         total_personal_spent = abs(personal_df["amount"].sum())
         budget_limit = 750.00
         remaining_budget = budget_limit - total_personal_spent
 
         m1, m2, m3 = st.columns(3)
-        m1.metric("Monthly Personal Budget", f"${budget_limit:,.2f}")
+        m1.metric("Personal Budget Target", f"${budget_limit:,.2f}")
         m2.metric("Total Personal Spent", f"${total_personal_spent:,.2f}", delta=f"-${total_personal_spent:,.2f}")
         m3.metric("Budget Remaining", f"${remaining_budget:,.2f}", delta=f"${remaining_budget:,.2f}")
 
         st.progress(
             min(total_personal_spent / budget_limit, 1.0),
-            text=f"Budget Usage: {(total_personal_spent / budget_limit) * 100:.1f}%",
+            text=f"Personal Budget Usage: {(total_personal_spent / budget_limit) * 100:.1f}%",
         )
 
         st.divider()
 
-        c1, c2 = st.columns(2)
-        expenses_df = cycle_df[cycle_df["amount"] < 0].copy()
-        expenses_df["abs_amount"] = expenses_df["amount"].abs()
-
-        with c1:
-            st.subheader("Expenses Distribution")
-            if not expenses_df.empty:
-                cat_summary = expenses_df.groupby("category")["abs_amount"].sum().reset_index()
-                fig_pie = px.pie(cat_summary, values="abs_amount", names="category", hole=0.4, title=f"Category Breakdown ({selected_cycle})")
+        if not personal_df.empty:
+            personal_df["abs_amount"] = personal_df["amount"].abs()
+            c1, c2 = st.columns(2)
+            with c1:
+                st.subheader("Personal Spending Breakdown")
+                cat_summary = personal_df.groupby("category")["abs_amount"].sum().reset_index()
+                fig_pie = px.pie(cat_summary, values="abs_amount", names="category", hole=0.4)
                 st.plotly_chart(fig_pie, use_container_width=True)
 
-        with c2:
-            st.subheader("Top Expenses")
-            if not expenses_df.empty:
-                top_tx = expenses_df.sort_values(by="abs_amount", ascending=False).head(10)
-                fig_bar = px.bar(top_tx, x="abs_amount", y="description", orientation="h", color="category", title="Top 10 Largest Expenses")
+            with c2:
+                st.subheader("Top Personal Purchases")
+                top_tx = personal_df.sort_values(by="abs_amount", ascending=False).head(10)
+                fig_bar = px.bar(top_tx, x="abs_amount", y="description", orientation="h", color="category")
                 st.plotly_chart(fig_bar, use_container_width=True)
+        else:
+            st.success("No personal spending recorded for this cycle yet!")
 
     with tab2:
-        st.subheader("Categorize Transactions")
+        st.subheader("Manage & Override Filtered Items")
+        st.write("Toggle items off if they are bills/groceries/fuel, or re-include them if they are personal spending.")
+        
         filter_cycle = st.selectbox("Filter Cycle", cycles, key="tag_cycle_filter")
-        tag_df = df_tx[df_tx["cycle_name"] == filter_cycle]
-
+        cycle_all_df = df_tx[df_tx["cycle_name"] == filter_cycle]
         all_cats = get_categories()
 
-        for _, row in tag_df.iterrows():
-            r1, r2, r3, r4 = st.columns([1.5, 3.5, 1.5, 2.5])
+        for _, row in cycle_all_df.iterrows():
+            r1, r2, r3, r4, r5 = st.columns([1.5, 3.5, 1.5, 2.0, 1.5])
             r1.write(row["date"])
             r2.write(row["description"])
             r3.write(f"${row['amount']:,.2f}")
 
+            is_personal = r4.checkbox("Include in Personal", value=(row["is_excluded"] == 0), key=f"chk_{row['id']}")
+            
             curr_idx = all_cats.index(row["category"]) if row["category"] in all_cats else 0
-            selected_cat = r4.selectbox("Category", all_cats, index=curr_idx, key=f"tx_{row['id']}", label_visibility="collapsed")
+            selected_cat = r5.selectbox("Sub-Category", all_cats, index=curr_idx, key=f"cat_{row['id']}", label_visibility="collapsed")
 
-            if selected_cat != row["category"]:
-                update_transaction_category(row["id"], selected_cat)
+            new_excluded_val = 0 if is_personal else 1
+            if new_excluded_val != row["is_excluded"] or selected_cat != row["category"]:
+                update_transaction_status(row["id"], new_excluded_val, selected_cat)
                 st.rerun()
-
-    with tab3:
-        st.subheader("Month-over-Month Spending Trends")
-        all_exp = df_tx[df_tx["amount"] < 0].copy()
-        all_exp["abs_amount"] = all_exp["amount"].abs()
-
-        if not all_exp.empty:
-            hist_summary = all_exp.groupby(["cycle_name", "category"])["abs_amount"].sum().reset_index()
-            fig_hist = px.bar(hist_summary, x="cycle_name", y="abs_amount", color="category", barmode="group", title="Spending by Category Across All Cycles")
-            st.plotly_chart(fig_hist, use_container_width=True)
-
-            st.subheader("Personal Spending vs $750 Limit Over Time")
-            p_trend = all_exp[all_exp["category"] == "Personal Spending"].groupby("cycle_name")["abs_amount"].sum().reset_index()
-            if not p_trend.empty:
-                fig_trend = px.line(p_trend, x="cycle_name", y="abs_amount", markers=True, title="Personal Spending Trend")
-                fig_trend.add_hline(y=750, line_dash="dash", line_color="red", annotation_text="$750 Target Limit")
-                st.plotly_chart(fig_trend, use_container_width=True)
