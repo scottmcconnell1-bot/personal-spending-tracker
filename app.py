@@ -15,7 +15,6 @@ def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # Categories table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS categories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -23,7 +22,6 @@ def init_db():
     )
     """)
 
-    # Exclusion keywords table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS exclude_keywords (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,7 +29,6 @@ def init_db():
     )
     """)
 
-    # Transactions table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS transactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,7 +44,6 @@ def init_db():
     )
     """)
 
-    # Ensure schema is up to date
     cursor.execute("PRAGMA table_info(transactions)")
     existing_columns = [col[1] for col in cursor.fetchall()]
     if "is_excluded" not in existing_columns and len(existing_columns) > 0:
@@ -56,7 +52,6 @@ def init_db():
     if "category" not in existing_columns and len(existing_columns) > 0:
         cursor.execute("ALTER TABLE transactions ADD COLUMN category TEXT DEFAULT 'Personal Spending'")
 
-    # Default categories
     default_cats = [
         "Personal Spending",
         "Dining & Snacks",
@@ -67,7 +62,6 @@ def init_db():
     for cat in default_cats:
         cursor.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (cat,))
 
-    # Default exclusion keywords
     default_keywords = [
         "GROCERY", "WALMART", "KROGER", "ALDI", "SAFEWAY", "COSTCO",
         "SHELL", "CHEVRON", "EXXON", "MAVERIK", "FUEL", "GAS",
@@ -80,7 +74,6 @@ def init_db():
     conn.close()
 
 def clear_all_transactions():
-    """Removes all transactions from the database."""
     conn = get_db_connection()
     conn.execute("DELETE FROM transactions")
     conn.commit()
@@ -130,7 +123,7 @@ def delete_keyword(kw: str):
 
 def is_auto_excluded(description: str, amount: float, active_keywords: list) -> bool:
     if amount > 0:
-        return True # Income/Deposits
+        return True
     desc_upper = description.upper()
     return any(kw in desc_upper for kw in active_keywords)
 
@@ -146,6 +139,14 @@ def update_transaction_status(tx_id: int, is_excluded: int, category: str):
     conn.commit()
     conn.close()
 
+def find_column(df_cols, possible_names):
+    """Finds matching column name regardless of capitalization or extra spaces."""
+    cols_upper = {str(c).strip().upper(): c for c in df_cols}
+    for name in possible_names:
+        if name.upper() in cols_upper:
+            return cols_upper[name.upper()]
+    return None
+
 st.set_page_config(page_title="Personal Spending Tracker", page_icon="💳", layout="wide")
 init_db()
 
@@ -153,10 +154,13 @@ st.title("💳 Personal Spending Tracker")
 
 active_keywords = get_keywords()
 
-# Sidebar: CSV Upload, Keywords & Reset Options
+# Sidebar Setup
 with st.sidebar:
     st.header("📂 CSV File Importer")
     uploaded_files = st.file_uploader("Upload Checking CSV Files", type=["csv"], accept_multiple_files=True)
+
+    if uploaded_files:
+        st.info("💡 **File uploaded!** Click the **'Review & Select Imports'** tab in the main window to select rows.")
 
     st.divider()
     st.header("🔍 Auto-Exclude Keywords")
@@ -179,7 +183,7 @@ with st.sidebar:
         st.warning("Database cleared.")
         st.rerun()
 
-# Define the 3 Main Tabs
+# Define Navigation Tabs
 tab1, tab2, tab3 = st.tabs([
     "📊 Personal Budget Dashboard", 
     "📥 Review & Select Imports", 
@@ -189,31 +193,36 @@ tab1, tab2, tab3 = st.tabs([
 # Tab 2: Line-by-Line CSV Selection
 with tab2:
     st.subheader("Line-by-Line CSV Row Selection")
-    st.write("Check or uncheck individual rows to decide exactly which transactions get imported.")
-
+    
     if not uploaded_files:
-        st.info("Please upload a CSV file in the sidebar to review and select rows.")
+        st.info("Please upload a CSV file in the sidebar to review and select individual transaction rows.")
     else:
         all_staged_rows = []
         for file in uploaded_files:
             file.seek(0)
             df = pd.read_csv(file)
-            df.columns = [c.strip().upper() for c in df.columns]
+            
+            date_col = find_column(df.columns, ["DATE", "POST DATE", "TRANSACTION DATE"])
+            desc_col = find_column(df.columns, ["DESCRIPTION", "PAYEE", "NAME", "MEMO"])
+            amount_col = find_column(df.columns, ["AMOUNT", "TRANS AMOUNT"])
+            check_col = find_column(df.columns, ["CHECK #", "CHECK NUMBER", "CHECK"])
+            status_col = find_column(df.columns, ["STATUS"])
 
-            if not {"DATE", "DESCRIPTION", "AMOUNT"}.issubset(set(df.columns)):
-                st.error(f"File **{file.name}** is missing required columns (DATE, DESCRIPTION, AMOUNT).")
+            if not (date_col and desc_col and amount_col):
+                st.error(f"File **{file.name}** is missing required Date, Description, or Amount columns.")
                 continue
 
             for idx, row in df.iterrows():
-                date_val = str(row["DATE"]).strip()
-                desc_val = str(row["DESCRIPTION"]).strip()
+                date_val = str(row[date_col]).strip() if pd.notna(row[date_col]) else ""
+                desc_val = str(row[desc_col]).strip() if pd.notna(row[desc_col]) else ""
+                
                 try:
-                    amount_val = float(row["AMOUNT"])
-                except ValueError:
+                    amount_val = float(row[amount_col])
+                except (ValueError, TypeError):
                     continue
 
-                check_val = str(row["CHECK #"]) if "CHECK #" in df.columns and pd.notna(row["CHECK #"]) else ""
-                status_val = str(row["STATUS"]) if "STATUS" in df.columns and pd.notna(row["STATUS"]) else ""
+                check_val = str(row[check_col]) if check_col and pd.notna(row[check_col]) else ""
+                status_val = str(row[status_col]) if status_col and pd.notna(row[status_col]) else ""
                 cycle_val = calculate_cycle(date_val)
                 auto_ex = is_auto_excluded(desc_val, amount_val, active_keywords)
 
@@ -232,10 +241,12 @@ with tab2:
         if all_staged_rows:
             staged_df = pd.DataFrame(all_staged_rows)
 
+            st.write("Use the checkboxes in the **Import?** column to select or unselect individual lines:")
+
             edited_df = st.data_editor(
                 staged_df,
                 column_config={
-                    "Import?": st.column_config.CheckboxColumn("Import Row?", default=True),
+                    "Import?": st.column_config.CheckboxColumn("Import?", default=True),
                     "Include in Personal Budget?": st.column_config.CheckboxColumn("Personal Budget?", default=True),
                     "Amount": st.column_config.NumberColumn("Amount ($)", format="$%.2f"),
                 },
@@ -268,7 +279,7 @@ with tab2:
 
                 conn.commit()
                 conn.close()
-                st.success(f"Successfully imported {imported_count} row(s) into database!")
+                st.success(f"Successfully imported {imported_count} row(s) into database! ({skipped_count} duplicates skipped).")
                 st.rerun()
 
 # Fetch transactions from SQLite DB
@@ -276,10 +287,10 @@ conn = get_db_connection()
 df_tx = pd.read_sql_query("SELECT * FROM transactions", conn)
 conn.close()
 
-# Tab 1: Personal Budget Dashboard
+# Tab 1: Dashboard
 with tab1:
     if df_tx.empty or "is_excluded" not in df_tx.columns:
-        st.info("No transaction data loaded yet. Upload your bank CSV file and use the 'Review & Select Imports' tab to choose transactions.")
+        st.info("No transaction data loaded yet. Upload your bank CSV file and click the **Review & Select Imports** tab to choose transactions.")
     else:
         cycles = sorted(df_tx["cycle_name"].unique().tolist(), reverse=True)
         selected_cycle = st.selectbox("Select Billing Cycle", cycles)
@@ -319,7 +330,7 @@ with tab1:
         else:
             st.success("No personal spending recorded for this cycle yet!")
 
-# Tab 3: Tag & Filter Existing Database Records
+# Tab 3: Tag & Filter
 with tab3:
     if df_tx.empty or "is_excluded" not in df_tx.columns:
         st.info("No transaction data loaded yet.")
