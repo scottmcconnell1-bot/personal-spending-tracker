@@ -15,6 +15,7 @@ def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
 
+    # Categories table (allows adding/deleting dynamic custom categories)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS categories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -22,6 +23,7 @@ def init_db():
     )
     """)
 
+    # Exclusion keywords table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS exclude_keywords (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -29,6 +31,7 @@ def init_db():
     )
     """)
 
+    # Transactions table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS transactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,48 +41,38 @@ def init_db():
         amount REAL NOT NULL,
         check_num TEXT,
         status TEXT,
-        category TEXT DEFAULT 'Personal Spending',
+        category TEXT DEFAULT 'Uncategorized',
         is_excluded INTEGER DEFAULT 0,
         UNIQUE(date, description, amount)
     )
     """)
 
+    # Schema migration checks
     cursor.execute("PRAGMA table_info(transactions)")
     existing_columns = [col[1] for col in cursor.fetchall()]
     if "is_excluded" not in existing_columns and len(existing_columns) > 0:
         cursor.execute("ALTER TABLE transactions ADD COLUMN is_excluded INTEGER DEFAULT 0")
 
     if "category" not in existing_columns and len(existing_columns) > 0:
-        cursor.execute("ALTER TABLE transactions ADD COLUMN category TEXT DEFAULT 'Personal Spending'")
+        cursor.execute("ALTER TABLE transactions ADD COLUMN category TEXT DEFAULT 'Uncategorized'")
 
-    default_cats = [
-        "Personal Spending",
-        "Dining & Snacks",
-        "Hobbies & Shopping",
-        "Entertainment",
-        "Miscellaneous Personal"
-    ]
-    for cat in default_cats:
-        cursor.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (cat,))
-
-    default_keywords = [
-        "GROCERY", "WALMART", "KROGER", "ALDI", "SAFEWAY", "COSTCO",
-        "SHELL", "CHEVRON", "EXXON", "MAVERIK", "FUEL", "GAS",
-        "UTILITY", "POWER", "WATER", "MORTGAGE", "RENT", "INSURANCE"
-    ]
-    for kw in default_keywords:
-        cursor.execute("INSERT OR IGNORE INTO exclude_keywords (keyword) VALUES (?)", (kw.upper(),))
+    # Seed an initial default category if none exist
+    cursor.execute("SELECT COUNT(*) FROM categories")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("INSERT OR IGNORE INTO categories (name) VALUES ('Uncategorized')")
 
     conn.commit()
     conn.close()
 
 def clear_all_transactions():
+    """Wipes transactions table in SQLite."""
     conn = get_db_connection()
     conn.execute("DELETE FROM transactions")
     conn.commit()
     conn.close()
 
 def calculate_cycle(date_str: str) -> str:
+    """Converts transaction date into a billing cycle label (e.g. Sep 2026)."""
     try:
         dt = datetime.strptime(date_str, "%m/%d/%Y")
     except ValueError:
@@ -121,17 +114,37 @@ def delete_keyword(kw: str):
     conn.commit()
     conn.close()
 
+# Dynamic Category Functions
+def get_categories():
+    conn = get_db_connection()
+    categories = [row["name"] for row in conn.execute("SELECT name FROM categories ORDER BY name ASC").fetchall()]
+    conn.close()
+    if not categories:
+        return ["Uncategorized"]
+    return categories
+
+def add_category(cat_name: str):
+    if not cat_name.strip():
+        return
+    conn = get_db_connection()
+    try:
+        conn.execute("INSERT INTO categories (name) VALUES (?)", (cat_name.strip(),))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        pass
+    conn.close()
+
+def delete_category(cat_name: str):
+    conn = get_db_connection()
+    conn.execute("DELETE FROM categories WHERE name = ?", (cat_name,))
+    conn.commit()
+    conn.close()
+
 def is_auto_excluded(description: str, amount: float, active_keywords: list) -> bool:
     if amount > 0:
         return True
     desc_upper = description.upper()
     return any(kw in desc_upper for kw in active_keywords)
-
-def get_categories():
-    conn = get_db_connection()
-    categories = [row["name"] for row in conn.execute("SELECT name FROM categories ORDER BY name ASC").fetchall()]
-    conn.close()
-    return categories
 
 def update_transaction_status(tx_id: int, is_excluded: int, category: str):
     conn = get_db_connection()
@@ -140,7 +153,6 @@ def update_transaction_status(tx_id: int, is_excluded: int, category: str):
     conn.close()
 
 def find_column(df_cols, possible_names):
-    """Finds matching column name regardless of capitalization or extra spaces."""
     cols_upper = {str(c).strip().upper(): c for c in df_cols}
     for name in possible_names:
         if name.upper() in cols_upper:
@@ -153,14 +165,31 @@ init_db()
 st.title("💳 Personal Spending Tracker")
 
 active_keywords = get_keywords()
+active_categories = get_categories()
 
-# Sidebar Setup
+# Sidebar: Management Tools
 with st.sidebar:
     st.header("📂 CSV File Importer")
     uploaded_files = st.file_uploader("Upload Checking CSV Files", type=["csv"], accept_multiple_files=True)
 
     if uploaded_files:
-        st.info("💡 **File uploaded!** Click the **'Review & Select Imports'** tab in the main window to select rows.")
+        st.info("💡 **File uploaded!** Click the **'Review & Select Imports'** tab in the main window to choose rows.")
+
+    st.divider()
+    st.header("🏷️ Personal Categories Manager")
+    st.caption("Build custom categories as you go.")
+    new_cat = st.text_input("Add Custom Category")
+    if st.button("Add Category") and new_cat:
+        add_category(new_cat)
+        st.success(f"Added category: '{new_cat.strip()}'")
+        st.rerun()
+
+    if active_categories:
+        cat_to_delete = st.selectbox("Current Categories", active_categories)
+        if st.button("Delete Selected Category") and cat_to_delete:
+            delete_category(cat_to_delete)
+            st.warning(f"Deleted category '{cat_to_delete}'")
+            st.rerun()
 
     st.divider()
     st.header("🔍 Auto-Exclude Keywords")
@@ -187,7 +216,7 @@ with st.sidebar:
 tab1, tab2, tab3 = st.tabs([
     "📊 Personal Budget Dashboard", 
     "📥 Review & Select Imports", 
-    "⚙️ Filter & Tag Transactions"
+    "⚙️ Tag & Categorize Transactions"
 ])
 
 # Tab 2: Line-by-Line CSV Selection
@@ -269,7 +298,7 @@ with tab2:
                         conn.execute(
                             """
                             INSERT INTO transactions (date, cycle_name, description, amount, check_num, status, category, is_excluded)
-                            VALUES (?, ?, ?, ?, ?, ?, 'Personal Spending', ?)
+                            VALUES (?, ?, ?, ?, ?, ?, 'Uncategorized', ?)
                             """,
                             (row["Date"], row["Cycle"], row["Description"], float(row["Amount"]), row["Check #"], row["Status"], is_excluded_val),
                         )
@@ -293,7 +322,7 @@ with tab1:
         st.info("No transaction data loaded yet. Upload your bank CSV file and click the **Review & Select Imports** tab to choose transactions.")
     else:
         cycles = sorted(df_tx["cycle_name"].unique().tolist(), reverse=True)
-        selected_cycle = st.selectbox("Select Billing Cycle", cycles)
+        selected_cycle = st.selectbox("Select Billing Cycle to View", cycles)
 
         personal_df = df_tx[(df_tx["cycle_name"] == selected_cycle) & (df_tx["is_excluded"] == 0) & (df_tx["amount"] < 0)].copy()
 
@@ -330,26 +359,26 @@ with tab1:
         else:
             st.success("No personal spending recorded for this cycle yet!")
 
-# Tab 3: Tag & Filter
+# Tab 3: Categorize & Tag
 with tab3:
     if df_tx.empty or "is_excluded" not in df_tx.columns:
         st.info("No transaction data loaded yet.")
     else:
-        st.subheader("Manage Existing Database Records")
-        filter_cycle = st.selectbox("Filter Cycle", cycles, key="tag_cycle_filter")
+        st.subheader("Tag & Categorize Personal Transactions")
+        filter_cycle = st.selectbox("Filter Billing Cycle", cycles, key="tag_cycle_filter")
         cycle_all_df = df_tx[df_tx["cycle_name"] == filter_cycle]
         all_cats = get_categories()
 
         for _, row in cycle_all_df.iterrows():
-            r1, r2, r3, r4, r5 = st.columns([1.5, 3.5, 1.5, 2.0, 1.5])
+            r1, r2, r3, r4, r5 = st.columns([1.5, 3.5, 1.5, 2.0, 2.0])
             r1.write(row["date"])
             r2.write(row["description"])
             r3.write(f"${row['amount']:,.2f}")
 
-            is_personal = r4.checkbox("Include in Personal", value=(row["is_excluded"] == 0), key=f"chk_{row['id']}")
+            is_personal = r4.checkbox("Include in Personal Budget", value=(row["is_excluded"] == 0), key=f"chk_{row['id']}")
 
             curr_idx = all_cats.index(row["category"]) if row["category"] in all_cats else 0
-            selected_cat = r5.selectbox("Sub-Category", all_cats, index=curr_idx, key=f"cat_{row['id']}", label_visibility="collapsed")
+            selected_cat = r5.selectbox("Category", all_cats, index=curr_idx, key=f"cat_{row['id']}", label_visibility="collapsed")
 
             new_excluded_val = 0 if is_personal else 1
             if new_excluded_val != row["is_excluded"] or selected_cat != row["category"]:
