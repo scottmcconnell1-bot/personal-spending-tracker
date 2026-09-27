@@ -152,10 +152,25 @@ st.title("💳 Personal Spending Tracker & Budget Manager")
 with st.sidebar:
     st.header("📂 CSV File Importer")
     uploaded_files = st.file_uploader("Upload Checking CSV Files", type=["csv"], accept_multiple_files=True)
-    if uploaded_files and st.button("Import & Process Files"):
-        added, skipped = import_csv_files(uploaded_files)
-        st.success(f"Successfully imported **{added}** new records! ({skipped} duplicates automatically ignored).")
-        st.rerun()
+    
+    if uploaded_files:
+        st.subheader("Select files to import:")
+        file_dict = {f.name: f for f in uploaded_files}
+        
+        selected_filenames = []
+        for fname in file_dict.keys():
+            if st.checkbox(fname, value=True):
+                selected_filenames.append(fname)
+        
+        selected_files = [file_dict[fname] for fname in selected_filenames]
+        
+        if st.button("Import Selected Files"):
+            if not selected_files:
+                st.warning("No files selected for import.")
+            else:
+                added, skipped = import_csv_files(selected_files)
+                st.success(f"Successfully imported **{added}** new records from {len(selected_files)} file(s)! ({skipped} duplicates automatically ignored).")
+                st.rerun()
 
     st.divider()
     st.header("⚙️ Category Management")
