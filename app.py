@@ -1,85 +1,75 @@
-﻿import sqlite3
-from datetime import datetime
+﻿from datetime import datetime
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from streamlit_gsheets import GSheetsConnection
 
-DB_FILE = "spending.db"
+st.set_page_config(page_title="Personal Spending Tracker", page_icon="💳", layout="wide")
 
-def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
+# ---------------------------------------------------------------------------
+# Google Sheets storage (replaces SQLite so data survives app restarts)
+# Your spreadsheet needs three tabs, each with this header row in row 1:
+#   transactions: id | date | cycle_name | description | amount | check_num | status | category | is_excluded
+#   categories:   name
+#   keywords:     keyword
+# ---------------------------------------------------------------------------
+conn_gsheets = st.connection("gsheets", type=GSheetsConnection)
 
-def init_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
+TX_COLS = ["id", "date", "cycle_name", "description", "amount", "check_num", "status", "category", "is_excluded"]
+CAT_COLS = ["name"]
+KW_COLS = ["keyword"]
 
-    # Categories table (allows adding/deleting dynamic custom categories)
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS categories (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE NOT NULL
-    )
-    """)
+READ_TTL = 30  # seconds; cache is also cleared after every write
 
-    # Exclusion keywords table
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS exclude_keywords (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        keyword TEXT UNIQUE NOT NULL
-    )
-    """)
 
-    # Transactions table
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS transactions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT NOT NULL,
-        cycle_name TEXT NOT NULL,
-        description TEXT NOT NULL,
-        amount REAL NOT NULL,
-        check_num TEXT,
-        status TEXT,
-        category TEXT DEFAULT 'Uncategorized',
-        is_excluded INTEGER DEFAULT 0,
-        UNIQUE(date, description, amount)
-    )
-    """)
+def load_sheet(name: str, columns: list) -> pd.DataFrame:
+    try:
+        df = conn_gsheets.read(worksheet=name, ttl=READ_TTL)
+    except Exception as e:
+        st.error(
+            f"Could not read the **{name}** tab of your Google Sheet. "
+            f"Check that the tab exists, the header row is in place, and the sheet is shared with your service account.\n\n{e}"
+        )
+        st.stop()
+    df = df.dropna(how="all")
+    for c in columns:
+        if c not in df.columns:
+            df[c] = None
+    return df[columns].copy()
 
-    # Schema migration checks
-    cursor.execute("PRAGMA table_info(transactions)")
-    existing_columns = [col[1] for col in cursor.fetchall()]
-    if "is_excluded" not in existing_columns and len(existing_columns) > 0:
-        cursor.execute("ALTER TABLE transactions ADD COLUMN is_excluded INTEGER DEFAULT 0")
 
-    if "category" not in existing_columns and len(existing_columns) > 0:
-        cursor.execute("ALTER TABLE transactions ADD COLUMN category TEXT DEFAULT 'Uncategorized'")
+def save_sheet(name: str, df: pd.DataFrame):
+    conn_gsheets.update(worksheet=name, data=df)
+    st.cache_data.clear()
 
-    # Seed an initial default category if none exist
-    cursor.execute("SELECT COUNT(*) FROM categories")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT OR IGNORE INTO categories (name) VALUES ('Uncategorized')")
 
-    conn.commit()
-    conn.close()
+def load_transactions() -> pd.DataFrame:
+    df = load_sheet("transactions", TX_COLS)
+    df["id"] = pd.to_numeric(df["id"], errors="coerce").fillna(0).astype(int)
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+    df["is_excluded"] = pd.to_numeric(df["is_excluded"], errors="coerce").fillna(0).astype(int)
+    for c in ["date", "cycle_name", "description", "check_num", "status"]:
+        df[c] = df[c].fillna("").astype(str)
+    df["category"] = df["category"].fillna("Uncategorized").astype(str)
+    return df
+
 
 def clear_all_transactions():
-    """Wipes transactions table in SQLite."""
-    conn = get_db_connection()
-    conn.execute("DELETE FROM transactions")
-    conn.commit()
-    conn.close()
+    save_sheet("transactions", pd.DataFrame(columns=TX_COLS))
+
 
 def calculate_cycle(date_str: str) -> str:
     """Converts transaction date into a billing cycle label (e.g. Sep 2026)."""
-    try:
-        dt = datetime.strptime(date_str, "%m/%d/%Y")
-    except ValueError:
+    dt = None
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%Y-%m-%d %H:%M:%S"):
         try:
-            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            dt = datetime.strptime(date_str, fmt)
+            break
         except ValueError:
-            return "Unknown Cycle"
+            continue
+    if dt is None:
+        return "Unknown Cycle"
 
     if dt.day >= 25:
         if dt.month == 12:
@@ -91,54 +81,49 @@ def calculate_cycle(date_str: str) -> str:
 
     return cycle_dt.strftime("%b %Y")
 
-def get_keywords():
-    conn = get_db_connection()
-    keywords = [row["keyword"] for row in conn.execute("SELECT keyword FROM exclude_keywords ORDER BY keyword ASC").fetchall()]
-    conn.close()
-    return keywords
+
+# --- Keywords -------------------------------------------------------------
+def get_keywords() -> list:
+    df = load_sheet("keywords", KW_COLS)
+    return sorted(df["keyword"].dropna().astype(str).tolist())
+
 
 def add_keyword(kw: str):
-    if not kw.strip():
+    kw = kw.strip().upper()
+    if not kw:
         return
-    conn = get_db_connection()
-    try:
-        conn.execute("INSERT INTO exclude_keywords (keyword) VALUES (?)", (kw.strip().upper(),))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        pass
-    conn.close()
+    existing = get_keywords()
+    if kw in existing:
+        return
+    save_sheet("keywords", pd.DataFrame({"keyword": existing + [kw]}))
+
 
 def delete_keyword(kw: str):
-    conn = get_db_connection()
-    conn.execute("DELETE FROM exclude_keywords WHERE keyword = ?", (kw,))
-    conn.commit()
-    conn.close()
+    remaining = [k for k in get_keywords() if k != kw]
+    save_sheet("keywords", pd.DataFrame({"keyword": remaining}, columns=KW_COLS))
 
-# Dynamic Category Functions
-def get_categories():
-    conn = get_db_connection()
-    categories = [row["name"] for row in conn.execute("SELECT name FROM categories ORDER BY name ASC").fetchall()]
-    conn.close()
-    if not categories:
-        return ["Uncategorized"]
-    return categories
+
+# --- Categories -----------------------------------------------------------
+def get_categories() -> list:
+    df = load_sheet("categories", CAT_COLS)
+    cats = sorted(df["name"].dropna().astype(str).tolist())
+    return cats if cats else ["Uncategorized"]
+
 
 def add_category(cat_name: str):
-    if not cat_name.strip():
+    cat_name = cat_name.strip()
+    if not cat_name:
         return
-    conn = get_db_connection()
-    try:
-        conn.execute("INSERT INTO categories (name) VALUES (?)", (cat_name.strip(),))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        pass
-    conn.close()
+    existing = get_categories()
+    if cat_name in existing:
+        return
+    save_sheet("categories", pd.DataFrame({"name": existing + [cat_name]}))
+
 
 def delete_category(cat_name: str):
-    conn = get_db_connection()
-    conn.execute("DELETE FROM categories WHERE name = ?", (cat_name,))
-    conn.commit()
-    conn.close()
+    remaining = [c for c in get_categories() if c != cat_name]
+    save_sheet("categories", pd.DataFrame({"name": remaining}, columns=CAT_COLS))
+
 
 def is_auto_excluded(description: str, amount: float, active_keywords: list) -> bool:
     if amount > 0:
@@ -146,11 +131,6 @@ def is_auto_excluded(description: str, amount: float, active_keywords: list) -> 
     desc_upper = description.upper()
     return any(kw in desc_upper for kw in active_keywords)
 
-def update_transaction_status(tx_id: int, is_excluded: int, category: str):
-    conn = get_db_connection()
-    conn.execute("UPDATE transactions SET is_excluded = ?, category = ? WHERE id = ?", (is_excluded, category, tx_id))
-    conn.commit()
-    conn.close()
 
 def find_column(df_cols, possible_names):
     cols_upper = {str(c).strip().upper(): c for c in df_cols}
@@ -159,9 +139,10 @@ def find_column(df_cols, possible_names):
             return cols_upper[name.upper()]
     return None
 
-st.set_page_config(page_title="Personal Spending Tracker", page_icon="💳", layout="wide")
-init_db()
 
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 st.title("💳 Personal Spending Tracker")
 
 active_keywords = get_keywords()
@@ -207,22 +188,24 @@ with st.sidebar:
 
     st.divider()
     st.header("⚠️ Database Tools")
-    if st.button("Clear Database"):
+    confirm_clear = st.checkbox("I understand this deletes ALL saved transactions")
+    if st.button("Clear Database") and confirm_clear:
         clear_all_transactions()
-        st.warning("Database cleared.")
+        st.warning("All transactions cleared.")
         st.rerun()
 
-# Define Navigation Tabs
+df_tx = load_transactions()
+
 tab1, tab2, tab3 = st.tabs([
-    "📊 Personal Budget Dashboard", 
-    "📥 Review & Select Imports", 
-    "⚙️ Tag & Categorize Transactions"
+    "📊 Personal Budget Dashboard",
+    "📥 Review & Select Imports",
+    "⚙️ Tag & Categorize Transactions",
 ])
 
 # Tab 2: Line-by-Line CSV Selection
 with tab2:
     st.subheader("Line-by-Line CSV Row Selection")
-    
+
     if not uploaded_files:
         st.info("Please upload a CSV file in the sidebar to review and select individual transaction rows.")
     else:
@@ -230,7 +213,7 @@ with tab2:
         for file in uploaded_files:
             file.seek(0)
             df = pd.read_csv(file)
-            
+
             date_col = find_column(df.columns, ["DATE", "POST DATE", "TRANSACTION DATE"])
             desc_col = find_column(df.columns, ["DESCRIPTION", "PAYEE", "NAME", "MEMO"])
             amount_col = find_column(df.columns, ["AMOUNT", "TRANS AMOUNT"])
@@ -244,7 +227,7 @@ with tab2:
             for idx, row in df.iterrows():
                 date_val = str(row[date_col]).strip() if pd.notna(row[date_col]) else ""
                 desc_val = str(row[desc_col]).strip() if pd.notna(row[desc_col]) else ""
-                
+
                 try:
                     amount_val = float(row[amount_col])
                 except (ValueError, TypeError):
@@ -264,7 +247,7 @@ with tab2:
                     "Include in Personal Budget?": not auto_ex,
                     "Check #": check_val,
                     "Status": status_val,
-                    "Source File": file.name
+                    "Source File": file.name,
                 })
 
         if all_staged_rows:
@@ -281,50 +264,54 @@ with tab2:
                 },
                 disabled=["Date", "Description", "Amount", "Cycle", "Check #", "Status", "Source File"],
                 use_container_width=True,
-                key="csv_line_editor"
+                key="csv_line_editor",
             )
 
             selected_rows = edited_df[edited_df["Import?"] == True]
             st.write(f"**Selected for import:** {len(selected_rows)} of {len(edited_df)} rows")
 
             if st.button("Import Selected Lines", type="primary"):
-                conn = get_db_connection()
-                imported_count = 0
+                existing_keys = set(zip(df_tx["date"], df_tx["description"], df_tx["amount"].round(2)))
+                next_id = int(df_tx["id"].max()) + 1 if not df_tx.empty else 1
+                new_rows = []
                 skipped_count = 0
 
                 for _, row in selected_rows.iterrows():
-                    is_excluded_val = 0 if row["Include in Personal Budget?"] else 1
-                    try:
-                        conn.execute(
-                            """
-                            INSERT INTO transactions (date, cycle_name, description, amount, check_num, status, category, is_excluded)
-                            VALUES (?, ?, ?, ?, ?, ?, 'Uncategorized', ?)
-                            """,
-                            (row["Date"], row["Cycle"], row["Description"], float(row["Amount"]), row["Check #"], row["Status"], is_excluded_val),
-                        )
-                        imported_count += 1
-                    except sqlite3.IntegrityError:
+                    key = (row["Date"], row["Description"], round(float(row["Amount"]), 2))
+                    if key in existing_keys:
                         skipped_count += 1
+                        continue
+                    existing_keys.add(key)
+                    new_rows.append({
+                        "id": next_id,
+                        "date": row["Date"],
+                        "cycle_name": row["Cycle"],
+                        "description": row["Description"],
+                        "amount": float(row["Amount"]),
+                        "check_num": row["Check #"],
+                        "status": row["Status"],
+                        "category": "Uncategorized",
+                        "is_excluded": 0 if row["Include in Personal Budget?"] else 1,
+                    })
+                    next_id += 1
 
-                conn.commit()
-                conn.close()
-                st.success(f"Successfully imported {imported_count} row(s) into database! ({skipped_count} duplicates skipped).")
+                if new_rows:
+                    combined = pd.concat([df_tx, pd.DataFrame(new_rows)], ignore_index=True)
+                    save_sheet("transactions", combined[TX_COLS])
+                st.success(f"Imported {len(new_rows)} row(s) to Google Sheets! ({skipped_count} duplicates skipped).")
                 st.rerun()
-
-# Fetch transactions from SQLite DB
-conn = get_db_connection()
-df_tx = pd.read_sql_query("SELECT * FROM transactions", conn)
-conn.close()
 
 # Tab 1: Dashboard
 with tab1:
-    if df_tx.empty or "is_excluded" not in df_tx.columns:
+    if df_tx.empty:
         st.info("No transaction data loaded yet. Upload your bank CSV file and click the **Review & Select Imports** tab to choose transactions.")
     else:
         cycles = sorted(df_tx["cycle_name"].unique().tolist(), reverse=True)
         selected_cycle = st.selectbox("Select Billing Cycle to View", cycles)
 
-        personal_df = df_tx[(df_tx["cycle_name"] == selected_cycle) & (df_tx["is_excluded"] == 0) & (df_tx["amount"] < 0)].copy()
+        personal_df = df_tx[
+            (df_tx["cycle_name"] == selected_cycle) & (df_tx["is_excluded"] == 0) & (df_tx["amount"] < 0)
+        ].copy()
 
         total_personal_spent = abs(personal_df["amount"].sum())
         budget_limit = 750.00
@@ -359,28 +346,73 @@ with tab1:
         else:
             st.success("No personal spending recorded for this cycle yet!")
 
+        # ---- Historical trend across ALL saved cycles ----
+        st.divider()
+        st.subheader("📈 Historical Spending (all cycles)")
+        hist = df_tx[(df_tx["is_excluded"] == 0) & (df_tx["amount"] < 0)].copy()
+        if not hist.empty:
+            hist["abs_amount"] = hist["amount"].abs()
+            hist["cycle_dt"] = pd.to_datetime(hist["cycle_name"], format="%b %Y", errors="coerce")
+            hist = hist.dropna(subset=["cycle_dt"])
+
+            by_cycle = hist.groupby(["cycle_dt", "category"])["abs_amount"].sum().reset_index()
+            by_cycle["Cycle"] = by_cycle["cycle_dt"].dt.strftime("%b %Y")
+            fig_hist = px.bar(by_cycle, x="Cycle", y="abs_amount", color="category",
+                              labels={"abs_amount": "Spent ($)"})
+            fig_hist.add_hline(y=budget_limit, line_dash="dash", annotation_text="Budget")
+            st.plotly_chart(fig_hist, use_container_width=True)
+
+            report = (
+                hist.groupby("cycle_dt")["abs_amount"].sum().reset_index()
+                .sort_values("cycle_dt", ascending=False)
+            )
+            report["Cycle"] = report["cycle_dt"].dt.strftime("%b %Y")
+            report["Budget"] = budget_limit
+            report["Under / (Over)"] = report["Budget"] - report["abs_amount"]
+            report = report.rename(columns={"abs_amount": "Spent"})[["Cycle", "Spent", "Budget", "Under / (Over)"]]
+            st.dataframe(report, hide_index=True, use_container_width=True)
+            st.download_button("Download report (CSV)", report.to_csv(index=False), "spending_report.csv")
+        else:
+            st.info("No personal spending history yet.")
+
 # Tab 3: Categorize & Tag
 with tab3:
-    if df_tx.empty or "is_excluded" not in df_tx.columns:
+    if df_tx.empty:
         st.info("No transaction data loaded yet.")
     else:
         st.subheader("Tag & Categorize Personal Transactions")
-        filter_cycle = st.selectbox("Filter Billing Cycle", cycles, key="tag_cycle_filter")
-        cycle_all_df = df_tx[df_tx["cycle_name"] == filter_cycle]
+        cycles_t3 = sorted(df_tx["cycle_name"].unique().tolist(), reverse=True)
+        filter_cycle = st.selectbox("Filter Billing Cycle", cycles_t3, key="tag_cycle_filter")
         all_cats = get_categories()
 
-        for _, row in cycle_all_df.iterrows():
-            r1, r2, r3, r4, r5 = st.columns([1.5, 3.5, 1.5, 2.0, 2.0])
-            r1.write(row["date"])
-            r2.write(row["description"])
-            r3.write(f"${row['amount']:,.2f}")
+        cycle_df = df_tx[df_tx["cycle_name"] == filter_cycle].copy()
+        cycle_df["Include in Personal Budget?"] = cycle_df["is_excluded"] == 0
+        # Make sure any existing category is a valid option in the dropdown
+        options = sorted(set(all_cats) | set(cycle_df["category"].unique()))
 
-            is_personal = r4.checkbox("Include in Personal Budget", value=(row["is_excluded"] == 0), key=f"chk_{row['id']}")
+        editor_df = cycle_df[["id", "date", "description", "amount", "Include in Personal Budget?", "category"]]
 
-            curr_idx = all_cats.index(row["category"]) if row["category"] in all_cats else 0
-            selected_cat = r5.selectbox("Category", all_cats, index=curr_idx, key=f"cat_{row['id']}", label_visibility="collapsed")
+        edited_tags = st.data_editor(
+            editor_df,
+            column_config={
+                "id": None,  # hidden
+                "date": "Date",
+                "description": "Description",
+                "amount": st.column_config.NumberColumn("Amount ($)", format="$%.2f"),
+                "Include in Personal Budget?": st.column_config.CheckboxColumn("Personal Budget?"),
+                "category": st.column_config.SelectboxColumn("Category", options=options, required=True),
+            },
+            disabled=["id", "date", "description", "amount"],
+            hide_index=True,
+            use_container_width=True,
+            key=f"tag_editor_{filter_cycle}",
+        )
 
-            new_excluded_val = 0 if is_personal else 1
-            if new_excluded_val != row["is_excluded"] or selected_cat != row["category"]:
-                update_transaction_status(row["id"], new_excluded_val, selected_cat)
-                st.rerun()
+        if st.button("💾 Save Changes", type="primary"):
+            updates = edited_tags.set_index("id")
+            full = df_tx.set_index("id")
+            full.loc[updates.index, "category"] = updates["category"]
+            full.loc[updates.index, "is_excluded"] = (~updates["Include in Personal Budget?"]).astype(int)
+            save_sheet("transactions", full.reset_index()[TX_COLS])
+            st.success("Changes saved to Google Sheets.")
+            st.rerun()
